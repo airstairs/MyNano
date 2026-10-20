@@ -18,6 +18,8 @@ we got games local highscores saving for ghost runner competitions
 shit its mine though sorry
 
 
+pro tip... if you dont scroll backwards on scroll wheel to scrub forward in song in spotify view you gay
+
 
 
 pro tip... stickers on back iz fer babies >:'(
