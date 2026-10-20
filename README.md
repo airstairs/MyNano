@@ -21,3 +21,6 @@ shit its mine though sorry
 
 
 pro tip... stickers on back iz fer babies >:'(
+
+
+aka be pissed off if you see it on my phone makes some sense huh
