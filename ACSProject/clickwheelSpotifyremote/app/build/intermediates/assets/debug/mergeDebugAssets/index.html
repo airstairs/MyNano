@@ -1,0 +1,1647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>iPod Nano 1st Gen Simulation</title>
+    <link rel="stylesheet" href="tailwind.min.css">
+    <!-- Tailwind CSS CDN -->
+<!--     <script src="https://cdn.tailwindcss.com"></script> -->
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <!-- Three.js CDN -->
+    <script src="three.min.js"></script>
+
+    <script>
+        // ==========================================
+        // PERSISTENT LOCAL STORAGE HELPERS
+        // ==========================================
+        const STORAGE_PREFIX = "ipod_sim_";
+
+        function loadPersistentSettings() {
+            try {
+                const savedBody = localStorage.getItem(STORAGE_PREFIX + "body_hex");
+                if (savedBody) currentBodyHex = parseInt(savedBody, 10);
+
+                const savedWheelFill = localStorage.getItem(STORAGE_PREFIX + "wheel_fill");
+                const savedWheelCenter = localStorage.getItem(STORAGE_PREFIX + "wheel_center");
+                const savedWheelText = localStorage.getItem(STORAGE_PREFIX + "wheel_text");
+                if (savedWheelFill && savedWheelCenter && savedWheelText) {
+                    currentWheelFillHex = savedWheelFill;
+                    currentWheelCenterHex = parseInt(savedWheelCenter, 10);
+                    currentWheelTextHex = savedWheelText;
+                }
+
+                const savedLock = localStorage.getItem(STORAGE_PREFIX + "rotation_lock");
+                if (savedLock !== null) isRotationLocked = savedLock === "true";
+            } catch (e) {
+                console.error("Failed to load settings", e);
+            }
+        }
+
+        function saveSetting(key, val) {
+            try {
+                localStorage.setItem(STORAGE_PREFIX + key, val);
+            } catch (e) {
+                console.error("Failed to save setting", e);
+            }
+        }
+
+        function getHighScore(gameKey) {
+            try {
+                return parseInt(localStorage.getItem(STORAGE_PREFIX + "highscore_" + gameKey) || "0", 10);
+            } catch (e) {
+                return 0;
+            }
+        }
+
+        function saveHighScoreIfBetter(gameKey, score) {
+            try {
+                const current = getHighScore(gameKey);
+                if (score > current) {
+                    localStorage.setItem(STORAGE_PREFIX + "highscore_" + gameKey, score.toString());
+                    return true;
+                }
+            } catch (e) {}
+            return false;
+        }
+
+        // ==========================================
+        // 0. SPOTIFY API CONFIGURATION & AUTH (PKCE FLOW)
+        // ==========================================
+        const SPOTIFY_CLIENT_ID = "0ce7ee6296b64e8fa1a59f5136bf0b84";
+        const SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8000";
+        const SPOTIFY_SCOPES = [
+            "user-read-playback-state",
+            "user-modify-playback-state",
+            "user-read-currently-playing"
+        ].join(" ");
+
+        let spotifyCurrentTrack = {
+            title: "Not Playing",
+            artist: "Tap Center to Sync",
+            isPlaying: false,
+            progressMs: 0,
+            durationMs: 0
+        };
+
+        let albumImageObj = null;
+        let currentAlbumArtUrl = null;
+        let spotifyScrollOffset = 0;
+        let spotifyAnimPulse = 0;
+
+        // Custom Color States
+        let currentBodyHex = 0xeaeaea;
+        let currentWheelFillHex = "#dedede";
+        let currentWheelCenterHex = 0xeaeaea;
+        let currentWheelTextHex = "#7a7a7a";
+
+        // Settings State
+        let isRotationLocked = false;
+
+        // Load saved state immediately
+        loadPersistentSettings();
+
+        function updateAlbumArt(url) {
+            if (!url) {
+                albumImageObj = null;
+                currentAlbumArtUrl = null;
+                return;
+            }
+            if (url !== currentAlbumArtUrl) {
+                currentAlbumArtUrl = url;
+                albumImageObj = new Image();
+                albumImageObj.crossOrigin = "anonymous";
+                albumImageObj.src = url;
+                albumImageObj.onload = () => { screenTexture.needsUpdate = true; };
+            }
+        }
+
+        async function generateCodeVerifier() {
+            const array = new Uint32Array(56);
+            window.crypto.getRandomValues(array);
+            return Array.from(array, dec => ('0' + dec.toString(16)).substr(-2)).join('');
+        }
+
+        async function generateCodeChallenge(codeVerifier) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(codeVerifier);
+            const digest = await window.crypto.subtle.digest('SHA-256', data);
+            return btoa(String.fromCharCode.apply(null, new Uint8Array(digest)))
+                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        async function initiateSpotifyLogin() {
+            const codeVerifier = await generateCodeVerifier();
+            localStorage.setItem("spotify_code_verifier", codeVerifier);
+            const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+            const authUrl = `https://accounts.spotify.com/authorize?` +
+                `client_id=${SPOTIFY_CLIENT_ID}&` +
+                `response_type=code&` +
+                `redirect_uri=${encodeURIComponent(SPOTIFY_REDIRECT_URI)}&` +
+                `code_challenge_method=S256&` +
+                `code_challenge=${codeChallenge}&` +
+                `scope=${encodeURIComponent(SPOTIFY_SCOPES)}`;
+            
+            window.location.href = authUrl;
+        }
+
+        async function exchangeCodeForToken(code) {
+            const codeVerifier = localStorage.getItem("spotify_code_verifier");
+            if (!codeVerifier) return false;
+
+            const body = new URLSearchParams({
+                client_id: SPOTIFY_CLIENT_ID,
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: SPOTIFY_REDIRECT_URI,
+                code_verifier: codeVerifier,
+            });
+
+            try {
+                const res = await fetch('https://accounts.spotify.com/api/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body
+                });
+                const data = await res.json();
+                if (data.access_token) {
+                    localStorage.setItem("spotify_access_token", data.access_token);
+                    if (data.refresh_token) localStorage.setItem("spotify_refresh_token", data.refresh_token);
+                    return true;
+                }
+            } catch (err) {
+                console.error("Token exchange error:", err);
+            }
+            return false;
+        }
+
+        async function refreshSpotifyToken() {
+            const refreshToken = localStorage.getItem("spotify_refresh_token");
+            if (!refreshToken) return false;
+
+            const body = new URLSearchParams({
+                client_id: SPOTIFY_CLIENT_ID,
+                grant_type: 'refresh_token',
+                refresh_token: refreshToken
+            });
+
+            try {
+                const res = await fetch('https://accounts.spotify.com/api/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body
+                });
+                const data = await res.json();
+                if (data.access_token) {
+                    localStorage.setItem("spotify_access_token", data.access_token);
+                    if (data.refresh_token) localStorage.setItem("spotify_refresh_token", data.refresh_token);
+                    return true;
+                }
+            } catch (err) {
+                console.error("Token refresh error:", err);
+            }
+            return false;
+        }
+
+        async function checkSpotifyCallback() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const code = urlParams.get("code");
+            if (code) {
+                window.history.replaceState({}, document.title, window.location.pathname);
+                const success = await exchangeCodeForToken(code);
+                if (success) {
+                    launchSpotifyWindow();
+                }
+            } else if (localStorage.getItem("spotify_access_token")) {
+                fetchSpotifyPlaybackState();
+            }
+        }
+        checkSpotifyCallback();
+
+        async function fetchSpotifyPlaybackState() {
+            let token = localStorage.getItem("spotify_access_token");
+            if (!token) return;
+            try {
+                let res = await fetch("https://api.spotify.com/v1/me/player", {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (res.status === 401) {
+                    const refreshed = await refreshSpotifyToken();
+                    if (refreshed) {
+                        token = localStorage.getItem("spotify_access_token");
+                        res = await fetch("https://api.spotify.com/v1/me/player", {
+                            headers: { Authorization: `Bearer ${token}` }
+                        });
+                    } else {
+                        localStorage.removeItem("spotify_access_token");
+                        return;
+                    }
+                }
+                if (res.status === 200) {
+                    const data = await res.json();
+                    if (data && data.item) {
+                        spotifyCurrentTrack.title = data.item.name;
+                        spotifyCurrentTrack.artist = data.item.artists.map(a => a.name).join(", ");
+                        spotifyCurrentTrack.isPlaying = data.is_playing;
+                        spotifyCurrentTrack.progressMs = data.progress_ms || 0;
+                        spotifyCurrentTrack.durationMs = data.item.duration_ms || 0;
+                        const imgUrl = data.item.album.images[0]?.url;
+                        updateAlbumArt(imgUrl);
+                    }
+                }
+            } catch (err) {
+                console.error("Spotify Fetch Error:", err);
+            }
+        }
+
+        async function sendSpotifyCommand(endpoint, method = "PUT") {
+            let token = localStorage.getItem("spotify_access_token");
+            if (!token) return;
+            try {
+                let res = await fetch(`https://api.spotify.com/v1/me/player/${endpoint}`, {
+                    method: method,
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (res.status === 401) {
+                    const refreshed = await refreshSpotifyToken();
+                    if (refreshed) {
+                        token = localStorage.getItem("spotify_access_token");
+                        await fetch(`https://api.spotify.com/v1/me/player/${endpoint}`, {
+                            method: method,
+                            headers: { Authorization: `Bearer ${token}` }
+                        });
+                    }
+                }
+                setTimeout(fetchSpotifyPlaybackState, 300);
+            } catch (err) {
+                console.error("Spotify Command Error:", err);
+            }
+        }
+
+        async function seekSpotifyTimeline(offsetMs) {
+            let token = localStorage.getItem("spotify_access_token");
+            if (!token) return;
+            let targetMs = Math.max(0, Math.min(spotifyCurrentTrack.durationMs, spotifyCurrentTrack.progressMs + offsetMs));
+            spotifyCurrentTrack.progressMs = targetMs;
+            spotifyAnimPulse = 15;
+            try {
+                await fetch(`https://api.spotify.com/v1/me/player/seek?position_ms=${targetMs}`, {
+                    method: "PUT",
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+            } catch (err) {
+                console.error("Spotify Seek Error:", err);
+            }
+        }
+
+        // ==========================================
+        // GLOBAL MEDIA CONTROLS
+        // ==========================================
+        function handleGlobalPlayPause() {
+            if (localStorage.getItem("spotify_access_token")) {
+                sendSpotifyCommand(spotifyCurrentTrack.isPlaying ? "pause" : "play", "PUT");
+            }
+        }
+
+        function handleGlobalNextTrack() {
+            if (localStorage.getItem("spotify_access_token")) {
+                sendSpotifyCommand("next", "POST");
+            }
+        }
+
+        function handleGlobalPreviousTrack() {
+            if (localStorage.getItem("spotify_access_token")) {
+                sendSpotifyCommand("previous", "POST");
+            }
+        }
+
+        // ==========================================
+        // 1. GLOBAL HAPTICS & THREE.JS SCENE SETUP
+        // ==========================================
+        let hapticUnlocked = false;
+
+        function unlockAndVibrate(pattern = [35, 15, 35]) {
+            if (navigator.vibrate) {
+                if (!hapticUnlocked) {
+                    navigator.vibrate(1);
+                    hapticUnlocked = true;
+                }
+                navigator.vibrate(pattern);
+            }
+        }
+
+        window.addEventListener('pointerdown', () => unlockAndVibrate(1), { capture: true, once: true });
+
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+
+        const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 6.5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.75);
+        scene.add(ambientLight);
+
+        const mainLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        mainLight.position.set(4, 6, 5);
+        mainLight.castShadow = true;
+        mainLight.shadow.mapSize.width = 1024;
+        mainLight.shadow.mapSize.height = 1024;
+        scene.add(mainLight);
+
+        const fillLight = new THREE.DirectionalLight(0x90b0ff, 0.3);
+        fillLight.position.set(-4, -2, 3);
+        scene.add(fillLight);
+
+        const ipodGroup = new THREE.Group();
+        scene.add(ipodGroup);
+
+        const bodyMaterial = new THREE.MeshStandardMaterial({
+            color: currentBodyHex,
+            roughness: 0.15,
+            metalness: 0.12
+        });
+
+        const bodyGeo = new THREE.BoxGeometry(2.2, 4.4, 0.22);
+        const ipodBody = new THREE.Mesh(bodyGeo, bodyMaterial);
+        ipodBody.castShadow = true;
+        ipodBody.receiveShadow = true;
+        ipodGroup.add(ipodBody);
+
+        const backMaterial = new THREE.MeshStandardMaterial({
+            color: 0x999999,
+            roughness: 0.12,
+            metalness: 0.95
+        });
+        const backGeo = new THREE.BoxGeometry(2.18, 4.38, 0.02);
+        const backMesh = new THREE.Mesh(backGeo, backMaterial);
+        backMesh.position.set(0, 0, -0.11);
+        ipodGroup.add(backMesh);
+
+        // Apple Back Logo
+        const appleCanvas = document.createElement('canvas');
+        appleCanvas.width = 512;
+        appleCanvas.height = 512;
+        const appleCtx = appleCanvas.getContext('2d');
+
+        function drawAppleLogoTexture() {
+            appleCtx.clearRect(0, 0, 512, 512);
+            const path2D = new Path2D(`
+                M 324.3 273.8 
+                C 324.9 217.1 371.3 189 373.5 187.6 
+                C 347.1 149 306 143.7 291.8 143.1 
+                C 257.2 139.5 223.3 163.6 205.7 163.6 
+                C 188 163.6 160.2 143.3 131.2 143.8 
+                C 93.3 144.4 58.4 165.9 38.9 199.9 
+                C -0.7 268.7 28.9 370.4 67.2 425.8 
+                C 86 452.9 107.1 483.3 136.4 482.2 
+                C 164.8 481 175.5 463.8 207.8 463.8 
+                C 239.8 463.8 249.7 482.2 279 481.6 
+                C 309.1 481 328.1 453.8 346.7 426.6 
+                C 368.3 395.1 377.2 364.4 377.8 362.8 
+                C 376.6 362.3 323.7 341.9 324.3 273.8 Z 
+                M 252.8 107.8 
+                C 268 89.4 278.2 63.8 275.4 38.2 
+                C 253.4 39.1 226.7 52.9 211 71.3 
+                C 197 87.5 184.8 113.6 188.1 138.6 
+                C 212.7 140.5 237.7 126.2 252.8 107.8 Z
+            `);
+            appleCtx.save();
+            appleCtx.translate(64, 20);
+            appleCtx.scale(0.75, 0.75);
+            appleCtx.fillStyle = "#ffffff";
+            appleCtx.fill(path2D);
+            appleCtx.restore();
+        }
+        drawAppleLogoTexture();
+
+        const appleTexture = new THREE.CanvasTexture(appleCanvas);
+        const appleGeo = new THREE.PlaneGeometry(0.55, 0.55);
+        const appleMat = new THREE.MeshBasicMaterial({ map: appleTexture, transparent: true, blending: THREE.AdditiveBlending });
+        const appleMesh = new THREE.Mesh(appleGeo, appleMat);
+        appleMesh.position.set(0, 0.70, -0.121);
+        appleMesh.rotation.y = Math.PI;
+        ipodGroup.add(appleMesh);
+
+        // Hardware details
+        const accentMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 });
+        const holdSwitchGeo = new THREE.BoxGeometry(0.35, 0.04, 0.04);
+        const holdSwitch = new THREE.Mesh(holdSwitchGeo, accentMat);
+        holdSwitch.position.set(0.6, 2.21, 0);
+        ipodGroup.add(holdSwitch);
+
+        const screenBezelGeo = new THREE.PlaneGeometry(1.68, 1.28);
+        const screenBezelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.2 });
+        const screenBezel = new THREE.Mesh(screenBezelGeo, screenBezelMat);
+        screenBezel.position.set(0, 1.25, 0.111);
+        ipodGroup.add(screenBezel);
+
+        // Screen Mesh
+        const screenCanvas = document.createElement('canvas');
+        screenCanvas.width = 320;
+        screenCanvas.height = 240;
+        const screenCtx = screenCanvas.getContext('2d');
+
+        const screenTexture = new THREE.CanvasTexture(screenCanvas);
+        const screenGeo = new THREE.PlaneGeometry(1.60, 1.20);
+        const screenMat = new THREE.MeshBasicMaterial({ map: screenTexture });
+        const screenMesh = new THREE.Mesh(screenGeo, screenMat);
+        screenMesh.position.set(0, 1.25, 0.112);
+        ipodGroup.add(screenMesh);
+
+        const glassGeo = new THREE.PlaneGeometry(1.68, 1.28);
+        const glassMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, transparent: true, opacity: 0.08, roughness: 0.1, transmission: 0.9 });
+        const glassMesh = new THREE.Mesh(glassGeo, glassMat);
+        glassMesh.position.set(0, 1.25, 0.113);
+        ipodGroup.add(glassMesh);
+
+        // Wheel Mesh
+        const wheelGroup = new THREE.Group();
+        wheelGroup.position.set(0, -0.95, 0.112);
+        ipodGroup.add(wheelGroup);
+
+        const wheelCanvas = document.createElement('canvas');
+        wheelCanvas.width = 512;
+        wheelCanvas.height = 512;
+        const wheelCtx = wheelCanvas.getContext('2d');
+
+        function drawWheelCanvas() {
+            wheelCtx.clearRect(0, 0, 512, 512);
+            wheelCtx.fillStyle = currentWheelFillHex;
+            wheelCtx.beginPath();
+            wheelCtx.arc(256, 256, 250, 0, Math.PI * 2);
+            wheelCtx.fill();
+
+            wheelCtx.fillStyle = "#" + currentWheelCenterHex.toString(16).padStart(6, '0');
+            wheelCtx.beginPath();
+            wheelCtx.arc(256, 256, 85, 0, Math.PI * 2);
+            wheelCtx.fill();
+
+            wheelCtx.fillStyle = currentWheelTextHex;
+            wheelCtx.font = "bold 32px -apple-system, sans-serif";
+            wheelCtx.textAlign = "center";
+            wheelCtx.textBaseline = "middle";
+
+            wheelCtx.fillText("MENU", 256, 70);
+            wheelCtx.font = "bold 30px sans-serif";
+            wheelCtx.fillText("▶▶", 430, 256);
+            wheelCtx.fillText("◀◀", 82, 256);
+            wheelCtx.fillText("▶❚❚", 256, 442);
+        }
+        drawWheelCanvas();
+
+        const wheelTexture = new THREE.CanvasTexture(wheelCanvas);
+        const wheelGeo = new THREE.CircleGeometry(0.82, 64);
+        const wheelMat = new THREE.MeshBasicMaterial({ map: wheelTexture, side: THREE.DoubleSide });
+        const wheelMesh = new THREE.Mesh(wheelGeo, wheelMat);
+        wheelGroup.add(wheelMesh);
+
+        const centerBtnGeo = new THREE.CylinderGeometry(0.28, 0.28, 0.02, 32);
+        const centerBtnMat = new THREE.MeshStandardMaterial({ color: currentWheelCenterHex, roughness: 0.2 });
+        const centerBtnMesh = new THREE.Mesh(centerBtnGeo, centerBtnMat);
+        centerBtnMesh.rotation.x = Math.PI / 2;
+        centerBtnMesh.position.set(0, 0, 0.01);
+        wheelGroup.add(centerBtnMesh);
+
+        // Color Customization Handlers with Persistence
+        function setIpodBodyColor(colorHex) {
+            currentBodyHex = colorHex;
+            bodyMaterial.color.setHex(colorHex);
+            saveSetting("body_hex", colorHex);
+        }
+
+        function setIpodWheelColor(fillHex, centerHex, textHex) {
+            currentWheelFillHex = fillHex;
+            currentWheelCenterHex = centerHex;
+            currentWheelTextHex = textHex;
+            centerBtnMat.color.setHex(centerHex);
+            drawWheelCanvas();
+            wheelTexture.needsUpdate = true;
+            saveSetting("wheel_fill", fillHex);
+            saveSetting("wheel_center", centerHex);
+            saveSetting("wheel_text", textHex);
+        }
+
+        function resetIpodColors() {
+            setIpodBodyColor(0xeaeaea);
+            setIpodWheelColor("#dedede", 0xeaeaea, "#7a7a7a");
+        }
+
+        // ==========================================
+        // 2. UI & MENU SYSTEM
+        // ==========================================
+        let activeView = "menu";
+        let currentMenuKey = "main";
+        let selectedIndex = 0;
+
+        const menus = {
+            main: {
+                title: "iPod",
+                items: [
+                    { label: "Games", action: () => navigateTo("games") },
+                    { label: "Settings", action: () => navigateTo("settings") },
+                    { label: "Cydia", action: () => navigateTo("cydia") },
+                    { label: "Spotify", action: () => launchSpotifyWindow() }
+                ]
+            },
+            games: {
+                title: "Games",
+                items: [
+                    { label: "Catch-a-Trooper", action: () => launchGame("catchTrooper") },
+                    { label: "Parachute", action: () => launchGame("parachute") },
+                    { label: "Brick", action: () => launchGame("brick") },
+                    { label: "Calculator", action: () => launchGame("calculator") },
+                    { label: "Music Quiz", action: () => launchGame("musicQuiz") }
+                ]
+            },
+            settings: {
+                title: "Settings",
+                items: [
+                    { label: "Body: White", action: () => setIpodBodyColor(0xeaeaea) },
+                    { label: "Body: Black", action: () => setIpodBodyColor(0x18181a) },
+                    { label: "Spin iPod", action: () => spinIpod() },
+                    { label: "Lock Drag: " + (isRotationLocked ? "ON" : "OFF"), action: () => toggleLockRotation() }
+                ]
+            },
+            cydia: {
+                title: "Cydia Store",
+                items: [
+                    { label: "Jailbreak Colors", action: () => navigateTo("jailbreakColors") },
+                    { label: "Pong Retro", action: () => launchGame("pong") },
+                    { label: "📝 clickwheel Notes", action: () => launchGame("localNotes") }
+                ]
+            },
+            jailbreakColors: {
+                title: "Jailbreak Colors",
+                items: [
+                    { label: "Body Color", action: () => navigateTo("bodyColors") },
+                    { label: "Wheel Color", action: () => navigateTo("wheelColors") },
+                    { label: "🔄 Reset (Black & White)", action: () => resetIpodColors() }
+                ]
+            },
+            bodyColors: {
+                title: "Body Colors",
+                items: [
+                    { label: "🔶 Quite Orange", action: () => setIpodBodyColor(0xd97706) },
+                    { label: "🔴 Crimson Red", action: () => setIpodBodyColor(0xdc2626) },
+                    { label: "🔵 Electric Blue", action: () => setIpodBodyColor(0x2563eb) },
+                    { label: "🟣 Deep Purple", action: () => setIpodBodyColor(0x7c3aed) },
+                    { label: "🟢 Cyber Green", action: () => setIpodBodyColor(0x16a34a) },
+                    { label: "🟡 Gold Rush", action: () => setIpodBodyColor(0xeab308) },
+                    { label: "🌸 Neon Pink", action: () => setIpodBodyColor(0xec4899) }
+                ]
+            },
+            wheelColors: {
+                title: "Wheel Colors",
+                items: [
+                    { label: "⚙️ Dark Gray", action: () => setIpodWheelColor("#334155", 0x1e293b, "#f8fafc") },
+                    { label: "🖤 Jet Black", action: () => setIpodWheelColor("#09090b", 0x18181b, "#a1a1aa") },
+                    { label: "🤍 Pearl White", action: () => setIpodWheelColor("#f8fafc", 0xffffff, "#475569") },
+                    { label: "🔴 Red Accent", action: () => setIpodWheelColor("#dc2626", 0x991b1b, "#ffffff") },
+                    { label: "🔵 Blue Accent", action: () => setIpodWheelColor("#2563eb", 0x1d4ed8, "#ffffff") },
+                    { label: "🟡 Gold Accent", action: () => setIpodWheelColor("#ca8a04", 0xa16207, "#ffffff") }
+                ]
+            }
+        };
+
+        function toggleLockRotation() {
+            isRotationLocked = !isRotationLocked;
+            saveSetting("rotation_lock", isRotationLocked);
+            const lockItem = menus.settings.items.find(item => item.label.startsWith("Lock Drag"));
+            if (lockItem) {
+                lockItem.label = `Lock Drag: ${isRotationLocked ? "ON" : "OFF"}`;
+            }
+            drawMenuScreen();
+        }
+
+        function drawHeaderBar(titleText) {
+            const grad = screenCtx.createLinearGradient(0, 0, 0, 26);
+            grad.addColorStop(0, '#c3cbd6');
+            grad.addColorStop(1, '#9ba7b7');
+            screenCtx.fillStyle = grad;
+            screenCtx.fillRect(0, 0, 320, 26);
+
+            screenCtx.strokeStyle = '#718093';
+            screenCtx.lineWidth = 1;
+            screenCtx.beginPath();
+            screenCtx.moveTo(0, 26.5);
+            screenCtx.lineTo(320, 26.5);
+            screenCtx.stroke();
+
+            screenCtx.fillStyle = "#000000";
+            screenCtx.font = "bold 13px -apple-system, sans-serif";
+            screenCtx.textAlign = "center";
+            screenCtx.fillText(titleText, 160, 18);
+
+            screenCtx.fillStyle = "#111";
+            screenCtx.beginPath();
+            screenCtx.moveTo(10, 10);
+            screenCtx.lineTo(18, 14);
+            screenCtx.lineTo(10, 18);
+            screenCtx.fill();
+
+            if (spotifyCurrentTrack.isPlaying) {
+                screenCtx.fillStyle = "#16a34a";
+                screenCtx.font = "10px sans-serif";
+                screenCtx.fillText("▶", 272, 18);
+            }
+
+            screenCtx.strokeStyle = "#222";
+            screenCtx.strokeRect(286, 10, 22, 10);
+            screenCtx.fillRect(308, 13, 2, 4);
+            screenCtx.fillStyle = "#2ecc71";
+            screenCtx.fillRect(288, 12, 18, 6);
+        }
+
+        function drawMenuScreen() {
+            const menu = menus[currentMenuKey];
+            screenCtx.fillStyle = "#f2f5f8";
+            screenCtx.fillRect(0, 0, 320, 240);
+
+            drawHeaderBar(menu.title);
+
+            let startY = 32;
+            const itemHeight = 26;
+
+            menu.items.forEach((item, index) => {
+                const y = startY + (index * itemHeight);
+                if (index === selectedIndex) {
+                    const selGrad = screenCtx.createLinearGradient(0, y, 0, y + itemHeight);
+                    if (currentMenuKey.includes("cydia") || currentMenuKey.includes("Colors") || currentMenuKey.includes("jailbreak")) {
+                        selGrad.addColorStop(0, '#a855f7');
+                        selGrad.addColorStop(1, '#7e22ce');
+                    } else {
+                        selGrad.addColorStop(0, '#3882e0');
+                        selGrad.addColorStop(1, '#185ebd');
+                    }
+                    screenCtx.fillStyle = selGrad;
+                    screenCtx.fillRect(0, y, 320, itemHeight);
+                    screenCtx.fillStyle = "#ffffff";
+                } else {
+                    screenCtx.fillStyle = "#000000";
+                }
+
+                screenCtx.font = "bold 13px -apple-system, sans-serif";
+                screenCtx.textAlign = "left";
+                screenCtx.fillText(item.label, 14, y + 18);
+
+                screenCtx.font = "12px sans-serif";
+                screenCtx.textAlign = "right";
+                screenCtx.fillText(">", 306, y + 18);
+            });
+
+            screenTexture.needsUpdate = true;
+        }
+
+        function scrollMenu(dir) {
+            if (activeView !== "menu") {
+                if (activeView === "catchTrooper") onCatchTrooperScroll(dir);
+                if (activeView === "parachute") onParachuteScroll(dir);
+                if (activeView === "brick") onBrickScroll(dir);
+                if (activeView === "calculator") onCalculatorScroll(dir);
+                if (activeView === "pong") onPongScroll(dir);
+                if (activeView === "localNotes") onLocalNotesScroll(dir);
+                return;
+            }
+
+            const menu = menus[currentMenuKey];
+            const oldIndex = selectedIndex;
+            selectedIndex = Math.max(0, Math.min(menu.items.length - 1, selectedIndex + dir));
+
+            if (selectedIndex !== oldIndex) unlockAndVibrate([40, 20, 40]);
+            drawMenuScreen();
+        }
+
+        function navigateTo(key) {
+            currentMenuKey = key;
+            selectedIndex = 0;
+            drawMenuScreen();
+        }
+
+        function handleMenuButton() {
+            unlockAndVibrate([40, 20, 40]);
+            if (activeView !== "menu") {
+                exitCurrentGame();
+                return;
+            }
+            if (currentMenuKey === "bodyColors" || currentMenuKey === "wheelColors") navigateTo("jailbreakColors");
+            else if (currentMenuKey === "jailbreakColors") navigateTo("cydia");
+            else if (currentMenuKey !== "main") navigateTo("main");
+        }
+
+        function handleSelectButton() {
+            unlockAndVibrate([40, 20, 40]);
+            if (activeView === "menu") {
+                const menu = menus[currentMenuKey];
+                menu.items[selectedIndex].action();
+            } else if (activeView === "spotifyLogin") {
+                initiateSpotifyLogin();
+            } else if (activeView === "spotifyRemote") {
+                handleGlobalPlayPause();
+            } else if (activeView === "parachute") {
+                onParachuteSelect();
+            } else if (activeView === "calculator") {
+                onCalculatorSelect();
+            } else if (activeView === "pong") {
+                onPongSelect();
+            } else if (activeView === "localNotes") {
+                onLocalNotesSelect();
+            }
+        }
+
+        let isSpinning = false;
+        function spinIpod() {
+            if (isSpinning) return;
+            isSpinning = true;
+            
+            const startX = ipodGroup.rotation.x;
+            const startY = ipodGroup.rotation.y;
+            const startZ = ipodGroup.rotation.z;
+            const startTime = performance.now();
+            const duration = 1200;
+
+            function animateSpin(now) {
+                const elapsed = now - startTime;
+                const progress = Math.min(1, elapsed / duration);
+
+                if (progress < 1) {
+                    ipodGroup.rotation.y = startY + (Math.PI * 2) * progress;
+                    requestAnimationFrame(animateSpin);
+                } else {
+                    const snapStart = performance.now();
+                    const snapDuration = 300;
+                    const currentY = ipodGroup.rotation.y;
+                    
+                    function animateSnap(snapNow) {
+                        const snapElapsed = snapNow - snapStart;
+                        const snapProgress = Math.min(1, snapElapsed / snapDuration);
+                        const ease = 1 - Math.pow(1 - snapProgress, 3);
+
+                        ipodGroup.rotation.x = startX * (1 - ease);
+                        ipodGroup.rotation.y = currentY + (Math.round(currentY / (Math.PI * 2)) * Math.PI * 2 - currentY) * ease;
+                        ipodGroup.rotation.z = startZ * (1 - ease);
+
+                        if (snapProgress < 1) {
+                            requestAnimationFrame(animateSnap);
+                        } else {
+                            ipodGroup.rotation.set(0, 0, 0);
+                            isSpinning = false;
+                        }
+                    }
+                    requestAnimationFrame(animateSnap);
+                }
+            }
+            requestAnimationFrame(animateSpin);
+        }
+
+        // ==========================================
+        // SPOTIFY VIEW
+        // ==========================================
+        let spotifyInterval = null;
+
+        function launchSpotifyWindow() {
+            if (!localStorage.getItem("spotify_access_token")) {
+                activeView = "spotifyLogin";
+                drawSpotifyLoginScreen();
+            } else {
+                activeView = "spotifyRemote";
+                fetchSpotifyPlaybackState();
+                if (spotifyInterval) clearInterval(spotifyInterval);
+                spotifyInterval = setInterval(fetchSpotifyPlaybackState, 3000);
+                runSpotifyRemoteLoop();
+            }
+        }
+
+        function drawSpotifyLoginScreen() {
+            screenCtx.fillStyle = "#121212";
+            screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar("Spotify Login");
+
+            const cx = 160, cy = 90;
+            screenCtx.fillStyle = "#1DB954";
+            screenCtx.beginPath();
+            screenCtx.arc(cx, cy, 30, 0, Math.PI * 2);
+            screenCtx.fill();
+
+            screenCtx.strokeStyle = "#121212";
+            screenCtx.lineWidth = 3;
+            screenCtx.lineCap = "round";
+            for (let i = 1; i <= 3; i++) {
+                screenCtx.beginPath();
+                screenCtx.arc(cx, cy + 6, i * 10, Math.PI * 1.15, Math.PI * 1.85, false);
+                screenCtx.stroke();
+            }
+
+            const btnX = 60, btnY = 150, btnW = 200, btnH = 36;
+            screenCtx.fillStyle = "#1DB954";
+            screenCtx.beginPath();
+            screenCtx.roundRect(btnX, btnY, btnW, btnH, 18);
+            screenCtx.fill();
+
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.font = "bold 13px -apple-system, sans-serif";
+            screenCtx.textAlign = "center";
+            screenCtx.fillText("Login with Spotify", 160, 173);
+
+            screenCtx.fillStyle = "#888888";
+            screenCtx.font = "10px sans-serif";
+            screenCtx.fillText("Press Center Button to open Auth", 160, 210);
+
+            screenTexture.needsUpdate = true;
+        }
+
+        function formatTime(ms) {
+            const totalSecs = Math.floor(ms / 1000);
+            const mins = Math.floor(totalSecs / 60);
+            const secs = totalSecs % 60;
+            return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+        }
+
+        function runSpotifyRemoteLoop() {
+            if (activeView !== "spotifyRemote") return;
+
+            screenCtx.fillStyle = "#121212";
+            screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar("Spotify");
+
+            screenCtx.fillStyle = "#282828";
+            screenCtx.fillRect(16, 36, 96, 96);
+            if (albumImageObj && albumImageObj.complete) {
+                screenCtx.drawImage(albumImageObj, 16, 36, 96, 96);
+            } else {
+                screenCtx.fillStyle = "#1DB954";
+                screenCtx.beginPath();
+                screenCtx.arc(64, 84, 22, 0, Math.PI * 2);
+                screenCtx.fill();
+            }
+
+            // Scrolling Title logic
+            screenCtx.save();
+            screenCtx.beginPath();
+            screenCtx.rect(126, 36, 180, 26);
+            screenCtx.clip();
+
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.font = "bold 15px -apple-system, sans-serif";
+            screenCtx.textAlign = "left";
+
+            const titleWidth = screenCtx.measureText(spotifyCurrentTrack.title).width;
+            if (titleWidth > 180) {
+                spotifyScrollOffset += 0.6;
+                if (spotifyScrollOffset > titleWidth + 40) spotifyScrollOffset = -20;
+            } else {
+                spotifyScrollOffset = 0;
+            }
+            screenCtx.fillText(spotifyCurrentTrack.title, 126 - spotifyScrollOffset, 56);
+            screenCtx.restore();
+
+            screenCtx.fillStyle = "#b3b3b3";
+            screenCtx.font = "12px -apple-system, sans-serif";
+            screenCtx.textAlign = "left";
+            screenCtx.fillText(spotifyCurrentTrack.artist.substring(0, 22), 126, 80);
+
+            screenCtx.fillStyle = "#1DB954";
+            screenCtx.font = "bold 11px -apple-system, sans-serif";
+            screenCtx.fillText(spotifyCurrentTrack.isPlaying ? "▶ Playing" : "❚❚ Paused", 126, 106);
+
+            const barX = 16, barY = 154, barW = 288, barH = 8;
+            screenCtx.fillStyle = "#282828";
+            screenCtx.beginPath();
+            screenCtx.roundRect(barX, barY, barW, barH, 4);
+            screenCtx.fill();
+
+            const progress = spotifyCurrentTrack.durationMs > 0 
+                ? Math.min(1, spotifyCurrentTrack.progressMs / spotifyCurrentTrack.durationMs) 
+                : 0;
+            
+            if (progress > 0) {
+                screenCtx.fillStyle = spotifyAnimPulse > 0 ? "#facc15" : "#1DB954";
+                screenCtx.beginPath();
+                screenCtx.roundRect(barX, barY, barW * progress, barH, 4);
+                screenCtx.fill();
+            }
+            if (spotifyAnimPulse > 0) spotifyAnimPulse--;
+
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.font = "11px monospace";
+            screenCtx.textAlign = "left";
+            screenCtx.fillText(formatTime(spotifyCurrentTrack.progressMs), barX, barY + 24);
+
+            const remainingMs = Math.max(0, spotifyCurrentTrack.durationMs - spotifyCurrentTrack.progressMs);
+            screenCtx.textAlign = "right";
+            screenCtx.fillText("-" + formatTime(remainingMs), barX + barW, barY + 24);
+
+            screenTexture.needsUpdate = true;
+            gameLoopId = requestAnimationFrame(runSpotifyRemoteLoop);
+        }
+
+        // ==========================================
+        // 3. GAMES & CYDIA MINI-GAMES
+        // ==========================================
+        let gameLoopId = null;
+
+        function launchGame(gameName) {
+            activeView = gameName;
+            if (gameName === "catchTrooper") initCatchTrooper();
+            else if (gameName === "parachute") initParachute();
+            else if (gameName === "brick") initBrick();
+            else if (gameName === "calculator") initCalculator();
+            else if (gameName === "musicQuiz") initMusicQuiz();
+            else if (gameName === "pong") initPong();
+            else if (gameName === "localNotes") initLocalNotes();
+        }
+
+        function exitCurrentGame() {
+            if (gameLoopId) cancelAnimationFrame(gameLoopId);
+            if (spotifyInterval) clearInterval(spotifyInterval);
+            gameLoopId = null;
+            spotifyInterval = null;
+            activeView = "menu";
+            drawMenuScreen();
+        }
+
+        // --- CYDIA APP: LOCAL NOTES APP ---
+        let notesState = {};
+        function initLocalNotes() {
+            const savedNote = localStorage.getItem(STORAGE_PREFIX + "user_note") || "Hello Cydia Notes! Rotate wheel to pick letters, Center to type, Backspace to delete.";
+            notesState = {
+                text: savedNote,
+                chars: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?-_\b",
+                selectedCharIndex: 0,
+                statusMsg: ""
+            };
+            drawNotesScreen();
+        }
+
+        function onLocalNotesScroll(dir) {
+            notesState.selectedCharIndex = (notesState.selectedCharIndex + dir + notesState.chars.length) % notesState.chars.length;
+            unlockAndVibrate([15, 10, 15]);
+            drawNotesScreen();
+        }
+
+        function onLocalNotesSelect() {
+            const char = notesState.chars[notesState.selectedCharIndex];
+            if (char === '\b') {
+                notesState.text = notesState.text.slice(0, -1);
+            } else {
+                notesState.text += char;
+            }
+            // Auto-save to local storage
+            localStorage.setItem(STORAGE_PREFIX + "user_note", notesState.text);
+            notesState.statusMsg = "Saved!";
+            setTimeout(() => { notesState.statusMsg = ""; drawNotesScreen(); }, 800);
+            unlockAndVibrate([30, 15, 30]);
+            drawNotesScreen();
+        }
+
+        function drawNotesScreen() {
+            screenCtx.fillStyle = "#fffbeb";
+            screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar("clickwheel Notes");
+
+            // Text display area
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.fillRect(16, 34, 288, 110);
+            screenCtx.strokeStyle = "#e2e8f0";
+            screenCtx.strokeRect(16, 34, 288, 110);
+
+            screenCtx.fillStyle = "#1e293b";
+            screenCtx.font = "12px -apple-system, sans-serif";
+            screenCtx.textAlign = "left";
+            
+            // Simple text wrapping
+            const words = notesState.text.split('');
+            let line = "";
+            let lines = [];
+            for(let i=0; i<words.length; i++) {
+                let testLine = line + words[i];
+                if(screenCtx.measureText(testLine).width > 270) {
+                    lines.push(line);
+                    line = words[i];
+                } else {
+                    line = testLine;
+                }
+            }
+            lines.push(line);
+            
+            let startTextY = 52;
+            lines.slice(-6).forEach((l, idx) => {
+                screenCtx.fillText(l, 24, startTextY + (idx * 16));
+            });
+
+            // Keyboard wheel selector UI at bottom
+            screenCtx.fillStyle = "#f1f5f9";
+            screenCtx.fillRect(16, 152, 288, 74);
+            screenCtx.strokeStyle = "#cbd5e1";
+            screenCtx.strokeRect(16, 152, 288, 74);
+
+            screenCtx.fillStyle = "#64748b";
+            screenCtx.font = "10px sans-serif";
+            screenCtx.textAlign = "center";
+            screenCtx.fillText("Scroll Wheel to select letter, Center to append:", 160, 168);
+
+            const activeChar = notesState.chars[notesState.selectedCharIndex];
+            screenCtx.fillStyle = "#2563eb";
+            screenCtx.beginPath();
+            screenCtx.roundRect(132, 178, 56, 40, 6);
+            screenCtx.fill();
+
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.font = "bold 22px monospace";
+            screenCtx.textAlign = "center";
+            screenCtx.fillText(activeChar === ' ' ? 'SPC' : (activeChar === '\b' ? 'DEL' : activeChar), 160, 206);
+
+            if (notesState.statusMsg) {
+                screenCtx.fillStyle = "#16a34a";
+                screenCtx.font = "bold 10px sans-serif";
+                screenCtx.textAlign = "right";
+                screenCtx.fillText(notesState.statusMsg, 296, 26);
+            }
+
+            screenTexture.needsUpdate = true;
+        }
+
+        // --- CYDIA GAME: PONG RETRO ---
+        let pongState = {};
+        function initPong() {
+            pongState = {
+                playerY: 100,
+                aiY: 100,
+                paddleH: 40,
+                paddleW: 6,
+                ballX: 160,
+                ballY: 130,
+                ballVx: 2.8,
+                ballVy: 1.8,
+                playerScore: 0,
+                aiScore: 0
+            };
+            runPongLoop();
+        }
+
+        function onPongScroll(dir) {
+            pongState.playerY += dir * 14;
+            pongState.playerY = Math.max(30, Math.min(235 - pongState.paddleH, pongState.playerY));
+            unlockAndVibrate([20, 10, 20]);
+        }
+
+        function onPongSelect() {
+            pongState.ballVx *= -1;
+        }
+
+        function runPongLoop() {
+            if (activeView !== "pong") return;
+
+            screenCtx.fillStyle = "#0f172a";
+            screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar(`Pong - Hi: ${getHighScore("pong")} | You: ${pongState.playerScore}`);
+
+            const aiCenter = pongState.aiY + pongState.paddleH / 2;
+            if (aiCenter < pongState.ballY - 5) pongState.aiY += 2.2;
+            else if (aiCenter > pongState.ballY + 5) pongState.aiY -= 2.2;
+            pongState.aiY = Math.max(30, Math.min(235 - pongState.paddleH, pongState.aiY));
+
+            pongState.ballX += pongState.ballVx;
+            pongState.ballY += pongState.ballVy;
+
+            if (pongState.ballY <= 32 || pongState.ballY >= 234) {
+                pongState.ballVy *= -1;
+            }
+
+            if (pongState.ballX <= 20 && pongState.ballY >= pongState.playerY && pongState.ballY <= pongState.playerY + pongState.paddleH) {
+                pongState.ballVx = Math.abs(pongState.ballVx) + 0.1;
+                unlockAndVibrate([30, 15, 30]);
+            }
+
+            if (pongState.ballX >= 300 - pongState.paddleW && pongState.ballY >= pongState.aiY && pongState.ballY <= pongState.aiY + pongState.paddleH) {
+                pongState.ballVx = -Math.abs(pongState.ballVx) - 0.1;
+            }
+
+            if (pongState.ballX < 0) {
+                pongState.aiScore++;
+                pongState.ballX = 160; pongState.ballY = 130; pongState.ballVx = 2.8;
+            }
+            if (pongState.ballX > 320) {
+                pongState.playerScore++;
+                saveHighScoreIfBetter("pong", pongState.playerScore);
+                pongState.ballX = 160; pongState.ballY = 130; pongState.ballVx = -2.8;
+            }
+
+            screenCtx.strokeStyle = "#334155";
+            screenCtx.setLineDash([4, 4]);
+            screenCtx.beginPath();
+            screenCtx.moveTo(160, 30);
+            screenCtx.lineTo(160, 240);
+            screenCtx.stroke();
+            screenCtx.setLineDash([]);
+
+            screenCtx.fillStyle = "#38bdf8";
+            screenCtx.fillRect(12, pongState.playerY, pongState.paddleW, pongState.paddleH);
+            screenCtx.fillStyle = "#f43f5e";
+            screenCtx.fillRect(302, pongState.aiY, pongState.paddleW, pongState.paddleH);
+
+            screenCtx.fillStyle = "#ffffff";
+            screenCtx.fillRect(pongState.ballX - 3, pongState.ballY - 3, 6, 6);
+
+            screenTexture.needsUpdate = true;
+            gameLoopId = requestAnimationFrame(runPongLoop);
+        }
+
+        // CATCH-A-TROOPER
+        let catchState = {};
+        function initCatchTrooper() {
+            catchState = { boatX: 140, boatW: 40, heliX: -50, heliSpeed: 2, troopers: [], score: 0, lives: 3, spawnTimer: 0, frame: 0 };
+            runCatchTrooperLoop();
+        }
+        function onCatchTrooperScroll(dir) {
+            catchState.boatX += dir * 12;
+            catchState.boatX = Math.max(0, Math.min(320 - catchState.boatW, catchState.boatX));
+            unlockAndVibrate([30, 15, 30]);
+        }
+        function runCatchTrooperLoop() {
+            if (activeView !== "catchTrooper") return;
+            catchState.frame++;
+            screenCtx.fillStyle = "#70c5ce"; screenCtx.fillRect(0, 0, 320, 190);
+            screenCtx.fillStyle = "#1d4ed8"; screenCtx.fillRect(0, 190, 320, 50);
+            drawHeaderBar(`Catch - Hi: ${getHighScore("catchTrooper")} | Score: ${catchState.score}`);
+
+            catchState.heliX += catchState.heliSpeed;
+            if (catchState.heliX > 350) catchState.heliX = -60;
+            screenCtx.fillStyle = "#333"; screenCtx.fillRect(catchState.heliX, 38, 36, 12);
+
+            catchState.spawnTimer++;
+            if (catchState.spawnTimer % 75 === 0 && catchState.heliX > 20 && catchState.heliX < 280) {
+                catchState.troopers.push({ x: catchState.heliX + 16, y: 50, hasChute: false });
+            }
+
+            for (let i = catchState.troopers.length - 1; i >= 0; i--) {
+                const t = catchState.troopers[i];
+                if (t.y > 75) t.hasChute = true;
+                t.y += t.hasChute ? 1.2 : 3.0;
+
+                if (t.hasChute) {
+                    screenCtx.fillStyle = "#ef4444";
+                    screenCtx.beginPath(); screenCtx.arc(t.x, t.y - 10, 12, Math.PI, 0, false); screenCtx.fill();
+                }
+                screenCtx.fillStyle = "#000"; screenCtx.fillRect(t.x - 2, t.y, 4, 8);
+
+                if (t.y >= 184 && t.y <= 196 && t.x >= catchState.boatX - 6 && t.x <= catchState.boatX + catchState.boatW + 6) {
+                    catchState.score += 10;
+                    saveHighScoreIfBetter("catchTrooper", catchState.score);
+                    catchState.troopers.splice(i, 1); continue;
+                }
+                if (t.y > 198) {
+                    catchState.lives--; catchState.troopers.splice(i, 1);
+                    if (catchState.lives <= 0) { initCatchTrooper(); return; }
+                }
+            }
+
+            screenCtx.fillStyle = "#b45309"; screenCtx.fillRect(catchState.boatX, 190, catchState.boatW, 10);
+            screenCtx.fillStyle = "#ffffff"; screenCtx.font = "bold 12px sans-serif"; screenCtx.textAlign = "right";
+            screenCtx.fillText(`Lives: ${"❤️".repeat(catchState.lives)}`, 310, 230);
+
+            screenTexture.needsUpdate = true;
+            gameLoopId = requestAnimationFrame(runCatchTrooperLoop);
+        }
+
+        // PARACHUTE
+        let paraState = {};
+        function initParachute() {
+            paraState = { turretAngle: -1.57, soldiers: [], bullets: [], score: 0, misses: 0, spawnTimer: 0 };
+            runParachuteLoop();
+        }
+        function onParachuteScroll(dir) {
+            paraState.turretAngle += dir * 0.12;
+            paraState.turretAngle = Math.max(-2.6, Math.min(-0.5, paraState.turretAngle));
+            unlockAndVibrate([30, 15, 30]);
+        }
+        function onParachuteSelect() {
+            const speed = 6.0;
+            paraState.bullets.push({ x: 160, y: 215, vx: Math.cos(paraState.turretAngle) * speed, vy: Math.sin(paraState.turretAngle) * speed });
+            unlockAndVibrate([20, 10, 20]);
+        }
+        function runParachuteLoop() {
+            if (activeView !== "parachute") return;
+            screenCtx.fillStyle = "#0f172a"; screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar(`Parachute - Hi: ${getHighScore("parachute")} | Score: ${paraState.score}`);
+
+            paraState.spawnTimer++;
+            if (paraState.spawnTimer % 90 === 0) {
+                const fromLeft = Math.random() < 0.5;
+                paraState.soldiers.push({ x: fromLeft ? 10 : 310, y: 40 + Math.random() * 80, vx: fromLeft ? 0.7 : -0.7, vy: 0.5, alive: true, chuteOpen: true });
+            }
+
+            for (let i = paraState.bullets.length - 1; i >= 0; i--) {
+                const b = paraState.bullets[i]; b.x += b.vx; b.y += b.vy;
+                if (b.x < 0 || b.x > 320 || b.y < 30 || b.y > 240) paraState.bullets.splice(i, 1);
+            }
+
+            for (let i = paraState.soldiers.length - 1; i >= 0; i--) {
+                const s = paraState.soldiers[i]; s.x += s.vx; s.y += s.vy;
+                for (let j = paraState.bullets.length - 1; j >= 0; j--) {
+                    const b = paraState.bullets[j];
+                    if (Math.hypot(b.x - s.x, b.y - s.y) < 12) {
+                        if (s.chuteOpen) { s.chuteOpen = false; s.vy = 2.0; } else { s.alive = false; paraState.score += 15; saveHighScoreIfBetter("parachute", paraState.score); }
+                        paraState.bullets.splice(j, 1); break;
+                    }
+                }
+                if (s.alive) {
+                    if (s.chuteOpen) { screenCtx.fillStyle = "#e2e8f0"; screenCtx.beginPath(); screenCtx.arc(s.x, s.y - 8, 10, Math.PI, 0, false); screenCtx.fill(); }
+                    screenCtx.fillStyle = "#38bdf8"; screenCtx.fillRect(s.x - 3, s.y, 6, 10);
+                }
+                if (s.y >= 210 && s.alive && s.chuteOpen) {
+                    paraState.misses++;
+                    if (paraState.misses >= 3) { initParachute(); return; }
+                    paraState.soldiers.splice(i, 1);
+                }
+            }
+
+            screenCtx.fillStyle = "#facc15";
+            paraState.bullets.forEach(b => screenCtx.fillRect(b.x - 2, b.y - 2, 4, 4));
+
+            screenCtx.fillStyle = "#334155"; screenCtx.fillRect(0, 220, 320, 20);
+            screenCtx.strokeStyle = "#cbd5e1"; screenCtx.lineWidth = 6; screenCtx.lineCap = "round";
+            screenCtx.beginPath(); screenCtx.moveTo(160, 220);
+            screenCtx.lineTo(160 + Math.cos(paraState.turretAngle) * 28, 220 + Math.sin(paraState.turretAngle) * 28);
+            screenCtx.stroke();
+
+            screenTexture.needsUpdate = true;
+            gameLoopId = requestAnimationFrame(runParachuteLoop);
+        }
+
+        // BRICK
+        let brickState = {};
+        function initBrick() {
+            brickState = { paddleX: 130, paddleW: 56, ballX: 160, ballY: 180, ballVx: 2.2, ballVy: -2.2, score: 0, bricks: [] };
+            const colors = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6'];
+            for (let r = 0; r < 5; r++) {
+                for (let c = 0; c < 8; c++) {
+                    brickState.bricks.push({ x: c * 38 + 10, y: r * 14 + 36, w: 34, h: 10, color: colors[r], alive: true });
+                }
+            }
+            runBrickLoop();
+        }
+        function onBrickScroll(dir) {
+            brickState.paddleX += dir * 14;
+            brickState.paddleX = Math.max(6, Math.min(314 - brickState.paddleW, brickState.paddleX));
+            unlockAndVibrate([30, 15, 30]);
+        }
+        function runBrickLoop() {
+            if (activeView !== "brick") return;
+            screenCtx.fillStyle = "#0f172a"; screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar(`Brick - Hi: ${getHighScore("brick")} | Score: ${brickState.score}`);
+
+            brickState.ballX += brickState.ballVx; brickState.ballY += brickState.ballVy;
+            if (brickState.ballX <= 6 || brickState.ballX >= 314) brickState.ballVx *= -1;
+            if (brickState.ballY <= 32) brickState.ballVy *= -1;
+
+            if (brickState.ballY >= 216 && brickState.ballY <= 224 && brickState.ballX >= brickState.paddleX - 4 && brickState.ballX <= brickState.paddleX + brickState.paddleW + 4) {
+                brickState.ballVy = -Math.abs(brickState.ballVy);
+                brickState.ballVx = ((brickState.ballX - (brickState.paddleX + brickState.paddleW / 2)) / (brickState.paddleW / 2)) * 3.5;
+            }
+
+            if (brickState.ballY > 245) { initBrick(); return; }
+
+            brickState.bricks.forEach(b => {
+                if (b.alive && brickState.ballX >= b.x && brickState.ballX <= b.x + b.w && brickState.ballY >= b.y && brickState.ballY <= b.y + b.h) {
+                    b.alive = false; brickState.ballVy *= -1; brickState.score += 20;
+                    saveHighScoreIfBetter("brick", brickState.score);
+                }
+                if (b.alive) { screenCtx.fillStyle = b.color; screenCtx.fillRect(b.x, b.y, b.w, b.h); }
+            });
+
+            screenCtx.fillStyle = "#3882e0"; screenCtx.fillRect(brickState.paddleX, 220, brickState.paddleW, 8);
+            screenCtx.fillStyle = "#ffffff"; screenCtx.beginPath(); screenCtx.arc(brickState.ballX, brickState.ballY, 4, 0, Math.PI * 2); screenCtx.fill();
+
+            screenTexture.needsUpdate = true;
+            gameLoopId = requestAnimationFrame(runBrickLoop);
+        }
+
+        // CALCULATOR
+        let calcState = {};
+        function initCalculator() {
+            calcState = { display: "0", expression: "", selectedBtn: 0 };
+            calcState.buttons = [
+                ["7", "8", "9", "/"],
+                ["4", "5", "6", "*"],
+                ["1", "2", "3", "-"],
+                ["C", "0", "=", "+"]
+            ];
+            drawCalculatorScreen();
+        }
+        function onCalculatorScroll(dir) {
+            calcState.selectedBtn = (calcState.selectedBtn + dir + 16) % 16;
+            unlockAndVibrate([30, 15, 30]);
+            drawCalculatorScreen();
+        }
+        function onCalculatorSelect() {
+            const row = Math.floor(calcState.selectedBtn / 4);
+            const col = calcState.selectedBtn % 4;
+            const val = calcState.buttons[row][col];
+
+            if (val === "C") {
+                calcState.display = "0";
+                calcState.expression = "";
+            } else if (val === "=") {
+                try {
+                    calcState.display = String(eval(calcState.expression || calcState.display));
+                    calcState.expression = "";
+                } catch (e) {
+                    calcState.display = "Err";
+                }
+            } else {
+                if (calcState.display === "0" || calcState.display === "Err") {
+                    calcState.display = val;
+                } else {
+                    calcState.display += val;
+                }
+                calcState.expression += val;
+            }
+            drawCalculatorScreen();
+        }
+        function drawCalculatorScreen() {
+            screenCtx.fillStyle = "#1e293b"; screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar("Calculator");
+
+            screenCtx.fillStyle = "#0f172a";
+            screenCtx.fillRect(16, 36, 288, 38);
+            screenCtx.fillStyle = "#38bdf8";
+            screenCtx.font = "bold 20px monospace";
+            screenCtx.textAlign = "right";
+            screenCtx.fillText(calcState.display, 292, 62);
+
+            const startY = 82;
+            const btnW = 66, btnH = 34;
+            const startX = 16, gapX = 8, gapY = 6;
+
+            calcState.buttons.forEach((rowVals, r) => {
+                rowVals.forEach((val, c) => {
+                    const btnIndex = r * 4 + c;
+                    const bx = startX + c * (btnW + gapX);
+                    const by = startY + r * (btnH + gapY);
+
+                    screenCtx.fillStyle = btnIndex === calcState.selectedBtn ? "#3882e0" : "#334155";
+                    screenCtx.fillRect(bx, by, btnW, btnH);
+
+                    screenCtx.fillStyle = "#ffffff";
+                    screenCtx.font = "bold 15px sans-serif";
+                    screenCtx.textAlign = "center";
+                    screenCtx.fillText(val, bx + btnW / 2, by + 22);
+                });
+            });
+
+            screenTexture.needsUpdate = true;
+        }
+
+        // MUSIC QUIZ
+        function initMusicQuiz() {
+            screenCtx.fillStyle = "#121212"; 
+            screenCtx.fillRect(0, 0, 320, 240);
+            drawHeaderBar("Music Quiz");
+
+            const cx = 160, cy = 130;
+            screenCtx.fillStyle = "#1DB954";
+            screenCtx.beginPath();
+            screenCtx.arc(cx, cy, 45, 0, Math.PI * 2);
+            screenCtx.fill();
+
+            screenCtx.strokeStyle = "#121212";
+            screenCtx.lineWidth = 5;
+            screenCtx.lineCap = "round";
+
+            for (let i = 1; i <= 3; i++) {
+                screenCtx.beginPath();
+                screenCtx.arc(cx, cy + 10, i * 16, Math.PI * 1.15, Math.PI * 1.85, false);
+                screenCtx.stroke();
+            }
+
+            screenTexture.needsUpdate = true;
+        }
+
+        // ==========================================
+        // 4. CLICK WHEEL & 3D INTERACTION LOGIC
+        // ==========================================
+        const raycaster = new THREE.Raycaster();
+        let isDraggingWheel = false;
+        let isDraggingBody = false;
+        let previousAngle = null;
+        let lastMousePos = { x: 0, y: 0 };
+        let pointerDownPos = null;
+        let pointerDownTarget = null;
+
+        function getCanvasRelativeCoords(e) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+            const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+            return {
+                x: ((clientX - rect.left) / rect.width) * 2 - 1,
+                y: -((clientY - rect.top) / rect.height) * 2 + 1,
+                clientX,
+                clientY
+            };
+        }
+
+        function identifyWheelButton(point) {
+            const dx = point.x - wheelGroup.position.x;
+            const dy = point.y - wheelGroup.position.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist > 0.35) {
+                const angleDeg = Math.atan2(dy, dx) * (180 / Math.PI);
+                if (angleDeg > 45 && angleDeg < 135) return "menu";
+                if (angleDeg < -45 && angleDeg > -135) return "playpause";
+                if (Math.abs(angleDeg) <= 45) return "next";
+                return "prev";
+            }
+            return null;
+        }
+
+        function processWheelRotation(e) {
+            const coords = getCanvasRelativeCoords(e);
+            raycaster.setFromCamera(new THREE.Vector2(coords.x, coords.y), camera);
+            
+            const intersects = raycaster.intersectObject(wheelMesh);
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                const dx = point.x - wheelGroup.position.x;
+                const dy = point.y - wheelGroup.position.y;
+                const currentAngle = Math.atan2(dy, dx);
+
+                if (previousAngle !== null) {
+                    let deltaAngle = currentAngle - previousAngle;
+                    if (deltaAngle > Math.PI) deltaAngle -= Math.PI * 2;
+                    if (deltaAngle < -Math.PI) deltaAngle += Math.PI * 2;
+
+                    if (Math.abs(deltaAngle) > 0.35) {
+                        if (activeView === "spotifyRemote") {
+                            seekSpotifyTimeline(deltaAngle > 0 ? 5000 : -5000);
+                        } else {
+                            scrollMenu(deltaAngle > 0 ? -1 : 1);
+                        }
+                        previousAngle = currentAngle;
+                    }
+                } else {
+                    previousAngle = currentAngle;
+                }
+            }
+        }
+
+        function handlePointerDown(e) {
+            if (isSpinning) return;
+            const coords = getCanvasRelativeCoords(e);
+            raycaster.setFromCamera(new THREE.Vector2(coords.x, coords.y), camera);
+
+            pointerDownPos = { x: coords.clientX, y: coords.clientY };
+            lastMousePos = { x: coords.clientX, y: coords.clientY };
+            pointerDownTarget = null;
+
+            const centerIntersects = raycaster.intersectObject(centerBtnMesh);
+            if (centerIntersects.length > 0) {
+                pointerDownTarget = "center";
+                centerBtnMesh.position.z = 0.002;
+                return;
+            }
+
+            const wheelIntersects = raycaster.intersectObject(wheelMesh);
+            if (wheelIntersects.length > 0) {
+                isDraggingWheel = true;
+                const point = wheelIntersects[0].point;
+                const dx = point.x - wheelGroup.position.x;
+                const dy = point.y - wheelGroup.position.y;
+
+                previousAngle = Math.atan2(dy, dx);
+                pointerDownTarget = identifyWheelButton(point);
+                return;
+            }
+
+            const bodyIntersects = raycaster.intersectObject(ipodBody);
+            if (bodyIntersects.length > 0 && !isRotationLocked) {
+                isDraggingBody = true;
+                pointerDownTarget = "body";
+            }
+        }
+
+        function handlePointerMove(e) {
+            const coords = getCanvasRelativeCoords(e);
+
+            if (isDraggingWheel) {
+                processWheelRotation(e);
+            } else if (isDraggingBody && !isRotationLocked) {
+                const deltaX = coords.clientX - lastMousePos.x;
+                const deltaY = coords.clientY - lastMousePos.y;
+
+                ipodGroup.rotation.y += deltaX * 0.01;
+                ipodGroup.rotation.x += deltaY * 0.01;
+
+                lastMousePos = { x: coords.clientX, y: coords.clientY };
+            }
+        }
+
+        function handlePointerUp(e) {
+            const coords = getCanvasRelativeCoords(e);
+            if (pointerDownPos && !isDraggingBody) {
+                const distMoved = Math.hypot(coords.clientX - pointerDownPos.x, coords.clientY - pointerDownPos.y);
+
+                if (distMoved < 10 && pointerDownTarget) {
+                    if (pointerDownTarget === "center") {
+                        handleSelectButton();
+                    }
+                    else if (pointerDownTarget === "menu") {
+                        handleMenuButton();
+                    }
+                    else if (pointerDownTarget === "next") {
+                        unlockAndVibrate([30, 15, 30]);
+                        handleGlobalNextTrack();
+                        if (activeView === "menu") scrollMenu(1);
+                    }
+                    else if (pointerDownTarget === "prev") {
+                        unlockAndVibrate([30, 15, 30]);
+                        handleGlobalPreviousTrack();
+                        if (activeView === "menu") scrollMenu(-1);
+                    }
+                    else if (pointerDownTarget === "playpause") {
+                        unlockAndVibrate([30, 15, 30]);
+                        handleGlobalPlayPause();
+                    }
+                }
+            }
+
+            centerBtnMesh.position.z = 0.01;
+            isDraggingWheel = false;
+            isDraggingBody = false;
+            previousAngle = null;
+            pointerDownPos = null;
+            pointerDownTarget = null;
+        }
+
+        window.addEventListener('pointerdown', handlePointerDown);
+        window.addEventListener('pointermove', handlePointerMove);
+        window.addEventListener('pointerup', handlePointerUp);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+                if (activeView === "spotifyRemote") seekSpotifyTimeline(-5000);
+                else scrollMenu(-1);
+            }
+            if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+                if (activeView === "spotifyRemote") seekSpotifyTimeline(5000);
+                else scrollMenu(1);
+            }
+            if (e.key === 'Enter') handleSelectButton();
+            if (e.key === 'Escape' || e.key === 'Backspace') handleMenuButton();
+            if (e.key === ' ') handleGlobalPlayPause();
+        });
+
+        // ==========================================
+        // 5. ANIMATION LOOP & RESIZE
+        // ==========================================
+        drawMenuScreen();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
