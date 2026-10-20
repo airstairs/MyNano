@@ -17,3 +17,7 @@ we got games local highscores saving for ghost runner competitions
 
 shit its mine though sorry
 
+
+
+
+pro tip... stickers on back iz fer babies >:'(
