@@ -25,4 +25,18 @@ pro tip... if you dont scroll backwards on scroll wheel to scrub forward in song
 pro tip... stickers on back iz fer babies >:'(
 
 
-aka be pissed off if you see it on my phone makes some sense huh
+aka be pissed off if you see it on my phone makes some sense huh   
+
+
+
+<hr> 
+
+vers 2 released  
+
+
+![rec2](recording2.gif)   
+
+
+
+
+
