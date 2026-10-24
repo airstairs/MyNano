@@ -1,5 +1,14 @@
 # MyNano
-is mine  
+is mine    
+
+
+
+![wind](windowsmynano.png)  
+
+
+
+
+
 
 ![ic](ic.png)  
 
