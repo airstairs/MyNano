@@ -3,7 +3,8 @@ is mine
 
 ![ic](ic.png)  
 
-![rec](recording.gif)  
+
+<img src="recording.gif" alt="first gif" width="300">
 
 
 what difference between this and clickwheel-spotify remote
@@ -34,8 +35,7 @@ aka be pissed off if you see it on my phone makes some sense huh
 vers 2 released  
 
 
-![rec2](recording2.gif)   
-
+<img src="recording2.gif" alt="2nd gif" width="300">
 
 
 
